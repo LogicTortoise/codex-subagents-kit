@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# codex-subagent - POSIX wrapper around codex-subagents-kit Python scripts.
+#
+# Orchestrates subagent runs from a Codex-side controller.  Supports two
+# subagent runtimes, switchable via the `--runtime` flag:
+#
+#   --runtime claude   (default)  Spawn `claude -p --bare --output-format json`
+#   --runtime codex              Spawn `codex exec -c model_reasoning_effort=xhigh`
+#
+# The artifact contract, four-gate model, registry, scorecard, and audit
+# format are identical for both runtimes.
+
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+# Follow symlinks so this wrapper works whether invoked directly or via a symlink in PATH.
+TARGET_PATH="$SCRIPT_PATH"
+while [ -L "$TARGET_PATH" ]; do
+    LINK_DIR=$(dirname "$TARGET_PATH")
+    LINK_TARGET=$(readlink "$TARGET_PATH")
+    if [ "${LINK_TARGET#/}" != "$LINK_TARGET" ]; then
+        TARGET_PATH="$LINK_TARGET"
+    else
+        TARGET_PATH="$LINK_DIR/$LINK_TARGET"
+    fi
+done
+SCRIPT_DIR=$(cd "$(dirname "$TARGET_PATH")" && pwd)
+SKILL_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+SCRIPTS_DIR="$SKILL_DIR/scripts"
+
+PYTHON_BIN="${PYTHON:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="python"
+    else
+        echo "codex-subagent: no python interpreter found (tried python3, python). Set PYTHON=/path/to/python." >&2
+        exit 127
+    fi
+fi
+
+if [ ! -f "$SCRIPTS_DIR/init_subagent_run.py" ]; then
+    echo "codex-subagent: scripts/ not found next to bin/. Expected at: $SCRIPTS_DIR" >&2
+    exit 1
+fi
+
+usage() {
+    cat <<'EOF'
+codex-subagent - POSIX wrapper for codex-subagents-kit
+
+Usage:
+  codex-subagent <subcommand> [args...]
+  codex-subagent help
+
+Subcommands:
+  init        Initialize a subagent run directory
+              -> scripts/init_subagent_run.py
+  probe       Probe local subagent runtime facts
+              -> scripts/probe_subagent_runtime.py
+  check       Validate a run's artifacts (runtime-agnostic)
+              -> scripts/check_subagent_run.py
+  task        Spawn a child subagent run from a prompt file (artifact-orchestrated mode)
+              -> scripts/run_subagent_task.py
+  regression  Run forward/regression tests
+              -> scripts/run_subagent_regression.py
+  help        Show this message
+
+Runtimes (default: claude):
+  claude      Claude Code CLI  - claude -p --bare --output-format json
+  codex       Codex CLI         - codex exec -c model_reasoning_effort=xhigh
+
+Pass --runtime codex on init/probe/task/regression to switch.
+
+Each subcommand passes its flags through to the underlying Python script.
+Run `codex-subagent <subcommand> --help` for per-script flag docs.
+
+Environment:
+  PYTHON    Python interpreter to use (default: python3)
+
+Examples:
+  codex-subagent init       --workspace-root . --case my-task
+  codex-subagent init       --workspace-root . --case my-task --runtime codex
+  codex-subagent probe      --run-root .workspace/codex-subagents-kit/runs/<run_id> --workspace-root .
+  codex-subagent probe      --runtime codex --run-root ... --workspace-root ...
+  codex-subagent check      --run-root .workspace/codex-subagents-kit/runs/<run_id>
+  codex-subagent task       --runtime claude \
+                            --run-root .workspace/codex-subagents-kit/runs/<run_id> \
+                            --prompt-file .workspace/.../prompts/task-a.md \
+                            --output-file .workspace/.../outputs/task-a.md
+  codex-subagent task       --runtime codex \
+                            --run-root .workspace/codex-subagents-kit/runs/<run_id> \
+                            --prompt-file .workspace/.../prompts/task-a.md \
+                            --output-file .workspace/.../outputs/task-a.md
+EOF
+}
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 2
+fi
+
+subcommand="$1"
+shift
+
+case "$subcommand" in
+    init)         exec "$PYTHON_BIN" "$SCRIPTS_DIR/init_subagent_run.py"        "$@" ;;
+    probe)        exec "$PYTHON_BIN" "$SCRIPTS_DIR/probe_subagent_runtime.py"   "$@" ;;
+    check)        exec "$PYTHON_BIN" "$SCRIPTS_DIR/check_subagent_run.py"       "$@" ;;
+    task)         exec "$PYTHON_BIN" "$SCRIPTS_DIR/run_subagent_task.py"        "$@" ;;
+    regression)   exec "$PYTHON_BIN" "$SCRIPTS_DIR/run_subagent_regression.py"  "$@" ;;
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "codex-subagent: unknown subcommand: $subcommand" >&2
+        echo "Run 'codex-subagent help' for usage." >&2
+        exit 2
+        ;;
+esac
