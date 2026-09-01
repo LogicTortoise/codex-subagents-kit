@@ -244,6 +244,78 @@ def runtime_describe(name):
     raise SystemExit("Unknown runtime: {!r}".format(name))
 
 
+
+# Transient Claude CLI failure detection
+# ---------------------------------------------------------------------------
+# `claude -p --output-format json` envelopes transient auth / rate-limit
+# failures with `is_error: true` and a `result` string like
+# `"Not logged in · Please run /login"`. The exit code stays 0, so naive
+# subprocess handling writes the error string as if it were a successful
+# review. These helpers let the runner distinguish those from real output
+# and retry / fall back.
+
+_CLAUDE_TRANSIENT_RESULT_PATTERNS: tuple[str, ...] = (
+    r"Not logged in",
+    r"Please run /login",
+    r"rate.{0,5}limit",
+    r"Rate limit",
+    r"service unavailable",
+    r"Service Unavailable",
+    r"internal server error",
+    r"Internal server error",
+    r"please try again",
+    r"Please try again",
+    r"session expired",
+    r"Session expired",
+    r"connection reset",
+    r"Connection reset",
+    r"overloaded",
+    r"Overloaded",
+)
+_CLAUDE_TRANSIENT_RESULT_RE = re.compile(
+    "|".join(_CLAUDE_TRANSIENT_RESULT_PATTERNS), re.IGNORECASE
+)
+
+
+def is_claude_transient_envelope_failure(stdout: str) -> bool:
+    """True iff the JSON envelope is `is_error: true` AND result matches a
+    known transient pattern (auth flap, rate limit, server overload).
+
+    Hard parse failures / non-JSON stdout are NOT transient — surface them.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if not payload.get("is_error"):
+        return False
+    result = payload.get("result")
+    if not isinstance(result, str):
+        return False
+    return bool(_CLAUDE_TRANSIENT_RESULT_RE.search(result))
+
+
+def is_claude_not_logged_in_envelope(stdout: str) -> bool:
+    """True iff the envelope is a Claude "not logged in" failure.
+
+    Used to decide whether to drop `--bare` on retry (OAuth-only auth
+    fallback, per SKILL.md §runtime-modes).
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or not payload.get("is_error"):
+        return False
+    result = payload.get("result")
+    return isinstance(result, str) and (
+        "Not logged in" in result or "/login" in result
+    )
+
+
+
 __all__ = [
     "RUNTIME_CHOICES",
     "DEFAULT_RUNTIME",
@@ -266,4 +338,6 @@ __all__ = [
     "CODEX_DEFAULT_SANDBOX",
     "CODEX_DEFAULT_MODEL",
     "CODEX_DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT",
+    "is_claude_transient_envelope_failure",
+    "is_claude_not_logged_in_envelope",
 ]

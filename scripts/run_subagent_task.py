@@ -25,6 +25,7 @@ import json
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -45,7 +46,126 @@ from runtimes import (  # noqa: E402
     parse_claude_json_result,
     resolve_claude_executable,
     resolve_codex_executable,
+    is_claude_not_logged_in_envelope,
+    is_claude_transient_envelope_failure,
 )
+
+
+def _invoke_subprocess_with_retry(
+    command,
+    *,
+    prompt_text: str,
+    cwd: str,
+    runtime: str,
+    max_retries: int = 3,
+    backoff_schedule: tuple[float, ...] = (1.0, 3.0, 8.0),
+) -> subprocess.CompletedProcess:
+    """Run child subprocess with retry on transient Claude CLI failures.
+
+    Claude Code CLI 偶发 `is_error: true` + result 文本 = "Not logged in · Please
+    run /login"(OAuth token 刷新竞态,exit code 仍为 0),naive 写法把它当成功
+    写到 output file 当成 review 结果。本函数显式识别 transient 模式,重试 N 次
+    exponential backoff;持续 "Not logged in" 时按 SKILL.md runtime-modes 指引
+    去掉 `--bare`(OAuth-only fallback),给非 bare 一次机会。
+
+    Non-claude runtime (codex):不重试,直接透传,避免错误地把 codex 的
+    normal-but-empty stdout 当成 transient。
+
+    Args:
+        command:        初始 argv list(可含 --bare)。
+        prompt_text:    喂给子进程的 stdin。
+        cwd:            工作目录。
+        runtime:        "claude" / "codex"。
+        max_retries:    重试次数(默认 3 次,即总共最多 4 次调用)。
+        backoff_schedule: 每次重试前的 sleep 秒数,length 应 ≥ max_retries。
+
+    Returns:
+        最后一次 subprocess.CompletedProcess(无论成功失败都返最后一次的实际结果)。
+    """
+    if runtime != "claude":
+        # only claude envelope has this transient shape
+        return subprocess.run(
+            command,
+            input=prompt_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            cwd=cwd,
+        )
+
+    last: subprocess.CompletedProcess | None = None
+    bare_dropped = False
+
+    for attempt in range(max_retries + 1):
+        current_command = list(command)
+
+        # 第二次及以后如果还是 not-logged-in,尝试 OAuth fallback:去掉 --bare
+        if (
+            attempt > 0
+            and not bare_dropped
+            and "--bare" in current_command
+            and last is not None
+            and is_claude_not_logged_in_envelope(last.stdout)
+        ):
+            current_command.remove("--bare")
+            bare_dropped = True
+            print(
+                "[subagent-retry] dropping --bare (OAuth-only fallback per SKILL.md runtime-modes)",
+                file=sys.stderr,
+            )
+
+        if attempt > 0:
+            delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
+            print(
+                f"[subagent-retry] claude attempt {attempt}/{max_retries} after {delay}s delay",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+        last = subprocess.run(
+            current_command,
+            input=prompt_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            cwd=cwd,
+        )
+
+        if last.returncode != 0:
+            # 非零退出码通常不是 transient(网络挂掉可能 1,segfault 139,OOM 137)——
+            # 不做盲重试,直接报回 caller 决定
+            if attempt < max_retries and last.returncode in (1, 137, 139):
+                print(
+                    f"[subagent-retry] exit code {last.returncode}, may retry",
+                    file=sys.stderr,
+                )
+                continue
+            return last
+
+        if not is_claude_transient_envelope_failure(last.stdout):
+            # 真正成功:JSON envelope 不是 is_error,或不是 transient pattern
+            return last
+
+        # 是 transient envelope 错误,记录并重试
+        try:
+            payload = json.loads(last.stdout)
+            reason = payload.get("result", "<no result>")
+        except json.JSONDecodeError:
+            reason = "<non-json stdout>"
+        print(
+            f"[subagent-retry] transient envelope failure (attempt {attempt + 1}): {reason[:200]}",
+            file=sys.stderr,
+        )
+        if attempt >= max_retries:
+            # 用完所有重试,返最后一次结果(让 caller 看到 is_error)
+            return last
+
+    # 兜底;正常不会走到这
+    return last  # type: ignore[return-value]
 
 
 def write_claude_output(output_file, stdout, json_log_file):
@@ -239,15 +359,11 @@ def main():
         print(str(exc), file=sys.stderr)
         return 1
 
-    completed = subprocess.run(
+    completed = _invoke_subprocess_with_retry(
         command,
-        input=prompt_text,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+        prompt_text=prompt_text,
         cwd=str(workspace_root),
+        runtime=args.runtime,
     )
 
     if json_log_file:
